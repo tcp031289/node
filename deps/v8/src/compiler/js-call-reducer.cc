@@ -15,6 +15,7 @@
 #include "src/codegen/tnode.h"
 #include "src/compiler/access-builder.h"
 #include "src/compiler/access-info.h"
+#include "src/compiler/allocation-builder-inl.h"
 #include "src/compiler/allocation-builder.h"
 #include "src/compiler/compilation-dependencies.h"
 #include "src/compiler/feedback-source.h"
@@ -1479,12 +1480,12 @@ struct MapFrameStateParams {
   TNode<Object> receiver;
   TNode<Object> callback;
   TNode<Object> this_arg;
-  TNode<JSArray> a;
+  base::Optional<TNode<JSArray>> a;
   TNode<Object> original_length;
 };
 
 FrameState MapPreLoopLazyFrameState(const MapFrameStateParams& params) {
-  DCHECK(params.a.is_null());
+  DCHECK(!params.a);
   Node* checkpoint_params[] = {params.receiver, params.callback,
                                params.this_arg, params.original_length};
   return CreateJavaScriptBuiltinContinuationFrameState(
@@ -1497,7 +1498,7 @@ FrameState MapPreLoopLazyFrameState(const MapFrameStateParams& params) {
 FrameState MapLoopLazyFrameState(const MapFrameStateParams& params,
                                  TNode<Number> k) {
   Node* checkpoint_params[] = {
-      params.receiver,       params.callback, params.this_arg, params.a, k,
+      params.receiver,       params.callback, params.this_arg, *params.a, k,
       params.original_length};
   return CreateJavaScriptBuiltinContinuationFrameState(
       params.jsgraph, params.shared,
@@ -1509,7 +1510,7 @@ FrameState MapLoopLazyFrameState(const MapFrameStateParams& params,
 FrameState MapLoopEagerFrameState(const MapFrameStateParams& params,
                                   TNode<Number> k) {
   Node* checkpoint_params[] = {
-      params.receiver,       params.callback, params.this_arg, params.a, k,
+      params.receiver,       params.callback, params.this_arg, *params.a, k,
       params.original_length};
   return CreateJavaScriptBuiltinContinuationFrameState(
       params.jsgraph, params.shared,
@@ -2677,6 +2678,15 @@ Reduction JSCallReducer::ReduceFunctionPrototypeBind(Node* node) {
   static constexpr int kBoundThis = 1;
   static constexpr int kReceiverContextEffectAndControl = 4;
   int const arity = n.ArgumentCount();
+
+  if (arity > 0) {
+    MapRef fixed_array_map(broker(), factory()->fixed_array_map());
+    AllocationBuilder ab(jsgraph(), effect, control);
+    if (!ab.CanAllocateArray(arity, fixed_array_map)) {
+      return NoChange();
+    }
+  }
+
   int const arity_with_bound_this = std::max(arity, kBoundThis);
   int const input_count =
       arity_with_bound_this + kReceiverContextEffectAndControl;
@@ -3429,10 +3439,11 @@ Reduction JSCallReducer::ReduceArraySome(Node* node,
   return ReplaceWithSubgraph(&a, subgraph);
 }
 
+#if V8_ENABLE_WEBASSEMBLY
+
 namespace {
 
 bool CanInlineJSToWasmCall(const wasm::FunctionSig* wasm_signature) {
-  DCHECK(FLAG_turbo_inline_js_wasm_calls);
   if (wasm_signature->return_count() > 1) {
     return false;
   }
@@ -3454,16 +3465,13 @@ bool CanInlineJSToWasmCall(const wasm::FunctionSig* wasm_signature) {
 
 Reduction JSCallReducer::ReduceCallWasmFunction(
     Node* node, const SharedFunctionInfoRef& shared) {
+  DCHECK(flags() & kInlineJSToWasmCalls);
+
   JSCallNode n(node);
   const CallParameters& p = n.Parameters();
 
   // Avoid deoptimization loops
   if (p.speculation_mode() == SpeculationMode::kDisallowSpeculation) {
-    return NoChange();
-  }
-
-  // TODO(paolosev@microsoft.com): Enable inlining for calls in try/catch.
-  if (NodeProperties::IsExceptionalCall(node)) {
     return NoChange();
   }
 
@@ -3505,6 +3513,7 @@ Reduction JSCallReducer::ReduceCallWasmFunction(
   NodeProperties::ChangeOp(node, op);
   return Changed(node);
 }
+#endif  // V8_ENABLE_WEBASSEMBLY
 
 #ifndef V8_ENABLE_FP_PARAMS_IN_C_LINKAGE
 namespace {
@@ -4052,7 +4061,9 @@ bool ShouldUseCallICFeedback(Node* node) {
   } else if (m.IsPhi()) {
     // Protect against endless loops here.
     Node* control = NodeProperties::GetControlInput(node);
-    if (control->opcode() == IrOpcode::kLoop) return false;
+    if (control->opcode() == IrOpcode::kLoop ||
+        control->opcode() == IrOpcode::kDead)
+      return false;
     // Check if {node} is a Phi of nodes which shouldn't
     // use CallIC feedback (not looking through loops).
     int const value_input_count = m.node()->op()->ValueInputCount();
@@ -4630,9 +4641,11 @@ Reduction JSCallReducer::ReduceJSCall(Node* node,
     return ReduceCallApiFunction(node, shared);
   }
 
+#if V8_ENABLE_WEBASSEMBLY
   if ((flags() & kInlineJSToWasmCalls) && shared.wasm_function_signature()) {
     return ReduceCallWasmFunction(node, shared);
   }
+#endif  // V8_ENABLE_WEBASSEMBLY
 
   return NoChange();
 }
@@ -5380,24 +5393,31 @@ Reduction JSCallReducer::ReduceArrayPrototypePop(Node* node) {
       }
 
       // Compute the new {length}.
-      length = graph()->NewNode(simplified()->NumberSubtract(), length,
-                                jsgraph()->OneConstant());
+      Node* new_length = graph()->NewNode(simplified()->NumberSubtract(),
+                                          length, jsgraph()->OneConstant());
+
+      // This extra check exists solely to break an exploitation technique
+      // that abuses typer mismatches.
+      new_length = efalse = graph()->NewNode(
+          simplified()->CheckBounds(p.feedback(),
+                                    CheckBoundsFlag::kAbortOnOutOfBounds),
+          new_length, length, efalse, if_false);
 
       // Store the new {length} to the {receiver}.
       efalse = graph()->NewNode(
           simplified()->StoreField(AccessBuilder::ForJSArrayLength(kind)),
-          receiver, length, efalse, if_false);
+          receiver, new_length, efalse, if_false);
 
       // Load the last entry from the {elements}.
       vfalse = efalse = graph()->NewNode(
           simplified()->LoadElement(AccessBuilder::ForFixedArrayElement(kind)),
-          elements, length, efalse, if_false);
+          elements, new_length, efalse, if_false);
 
       // Store a hole to the element we just removed from the {receiver}.
       efalse = graph()->NewNode(
           simplified()->StoreElement(
               AccessBuilder::ForFixedArrayElement(GetHoleyElementsKind(kind))),
-          elements, length, jsgraph()->TheHoleConstant(), efalse, if_false);
+          elements, new_length, jsgraph()->TheHoleConstant(), efalse, if_false);
     }
 
     control = graph()->NewNode(common()->Merge(2), if_true, if_false);
@@ -5573,19 +5593,27 @@ Reduction JSCallReducer::ReduceArrayPrototypeShift(Node* node) {
         }
 
         // Compute the new {length}.
-        length = graph()->NewNode(simplified()->NumberSubtract(), length,
-                                  jsgraph()->OneConstant());
+        Node* new_length = graph()->NewNode(simplified()->NumberSubtract(),
+                                            length, jsgraph()->OneConstant());
+
+        // This extra check exists solely to break an exploitation technique
+        // that abuses typer mismatches.
+        new_length = etrue1 = graph()->NewNode(
+            simplified()->CheckBounds(p.feedback(),
+                                      CheckBoundsFlag::kAbortOnOutOfBounds),
+            new_length, length, etrue1, if_true1);
 
         // Store the new {length} to the {receiver}.
         etrue1 = graph()->NewNode(
             simplified()->StoreField(AccessBuilder::ForJSArrayLength(kind)),
-            receiver, length, etrue1, if_true1);
+            receiver, new_length, etrue1, if_true1);
 
         // Store a hole to the element we just removed from the {receiver}.
         etrue1 = graph()->NewNode(
             simplified()->StoreElement(AccessBuilder::ForFixedArrayElement(
                 GetHoleyElementsKind(kind))),
-            elements, length, jsgraph()->TheHoleConstant(), etrue1, if_true1);
+            elements, new_length, jsgraph()->TheHoleConstant(), etrue1,
+            if_true1);
       }
 
       Node* if_false1 = graph()->NewNode(common()->IfFalse(), branch1);
@@ -7696,7 +7724,7 @@ Reduction JSCallReducer::ReduceRegExpPrototypeTest(Node* node) {
   if (ai_exec.IsInvalid()) return inference.NoChange();
 
   // If "exec" has been modified on {regexp}, we can't do anything.
-  if (ai_exec.IsDataConstant()) {
+  if (ai_exec.IsFastDataConstant()) {
     Handle<JSObject> holder;
     // Do not reduce if the exec method is not on the prototype chain.
     if (!ai_exec.holder().ToHandle(&holder)) return inference.NoChange();
@@ -7704,7 +7732,7 @@ Reduction JSCallReducer::ReduceRegExpPrototypeTest(Node* node) {
     JSObjectRef holder_ref(broker(), holder);
 
     // Bail out if the exec method is not the original one.
-    base::Optional<ObjectRef> constant = holder_ref.GetOwnDataProperty(
+    base::Optional<ObjectRef> constant = holder_ref.GetOwnFastDataProperty(
         ai_exec.field_representation(), ai_exec.field_index());
     if (!constant.has_value() ||
         !constant->equals(native_context().regexp_exec_function())) {
@@ -7716,6 +7744,7 @@ Reduction JSCallReducer::ReduceRegExpPrototypeTest(Node* node) {
         ai_exec.lookup_start_object_maps(), kStartAtPrototype,
         JSObjectRef(broker(), holder));
   } else {
+    // TODO(v8:11457) Support dictionary mode protoypes here.
     return inference.NoChange();
   }
 

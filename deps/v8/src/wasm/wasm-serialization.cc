@@ -19,6 +19,7 @@
 #include "src/wasm/module-compiler.h"
 #include "src/wasm/module-decoder.h"
 #include "src/wasm/wasm-code-manager.h"
+#include "src/wasm/wasm-engine.h"
 #include "src/wasm/wasm-module.h"
 #include "src/wasm/wasm-objects-inl.h"
 #include "src/wasm/wasm-objects.h"
@@ -711,11 +712,9 @@ DeserializationUnit NativeModuleDeserializer::ReadCode(int fn_index,
     constexpr size_t kMaxReservation =
         RoundUp<kCodeAlignment>(WasmCodeAllocator::kMaxCodeSpaceSize * 9 / 10);
     size_t code_space_size = std::min(kMaxReservation, remaining_code_size_);
-    current_code_space_ =
+    std::tie(current_code_space_, current_jump_tables_) =
         native_module_->AllocateForDeserializedCode(code_space_size);
     DCHECK_EQ(current_code_space_.size(), code_space_size);
-    current_jump_tables_ = native_module_->FindJumpTablesForRegion(
-        base::AddressRegionOf(current_code_space_));
     DCHECK(current_jump_tables_.is_valid());
   }
 

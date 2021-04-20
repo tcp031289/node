@@ -35,13 +35,10 @@ class ObjectSizeCounter : private HeapVisitor<ObjectSizeCounter> {
 
  private:
   static size_t ObjectSize(const HeapObjectHeader* header) {
-    const size_t size =
-        header->IsLargeObject()
-            ? static_cast<const LargePage*>(BasePage::FromPayload(header))
-                  ->PayloadSize()
-            : header->GetSize();
-    DCHECK_GE(size, sizeof(HeapObjectHeader));
-    return size - sizeof(HeapObjectHeader);
+    return header->IsLargeObject()
+               ? static_cast<const LargePage*>(BasePage::FromPayload(header))
+                     ->ObjectSize()
+               : header->ObjectSize();
   }
 
   bool VisitHeapObjectHeader(HeapObjectHeader* header) {
@@ -77,7 +74,7 @@ HeapBase::HeapBase(
       compactor_(raw_heap_),
       object_allocator_(&raw_heap_, page_backend_.get(),
                         stats_collector_.get()),
-      sweeper_(&raw_heap_, platform_.get(), stats_collector_.get()),
+      sweeper_(*this),
       stack_support_(stack_support) {
   stats_collector_->RegisterObserver(
       &allocation_observer_for_PROCESS_HEAP_STATISTICS_);
@@ -111,11 +108,12 @@ void HeapBase::Terminate() {
 
     // Clear root sets.
     strong_persistent_region_.ClearAllUsedNodes();
-    strong_cross_thread_persistent_region_.ClearAllUsedNodes();
-    // Clear weak root sets, as the GC below does not execute weakness
-    // callbacks.
     weak_persistent_region_.ClearAllUsedNodes();
-    weak_cross_thread_persistent_region_.ClearAllUsedNodes();
+    {
+      PersistentRegionLock guard;
+      strong_cross_thread_persistent_region_.ClearAllUsedNodes();
+      weak_cross_thread_persistent_region_.ClearAllUsedNodes();
+    }
 
     stats_collector()->NotifyMarkingStarted(
         GarbageCollector::Config::CollectionType::kMajor,
@@ -131,6 +129,11 @@ void HeapBase::Terminate() {
 
   object_allocator().Terminate();
   disallow_gc_scope_++;
+
+  CHECK_EQ(0u, strong_persistent_region_.NodesInUse());
+  CHECK_EQ(0u, weak_persistent_region_.NodesInUse());
+  CHECK_EQ(0u, strong_cross_thread_persistent_region_.NodesInUse());
+  CHECK_EQ(0u, weak_cross_thread_persistent_region_.NodesInUse());
 }
 
 HeapStatistics HeapBase::CollectStatistics(

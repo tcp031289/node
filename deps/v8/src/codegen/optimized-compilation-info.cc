@@ -13,7 +13,10 @@
 #include "src/objects/shared-function-info.h"
 #include "src/tracing/trace-event.h"
 #include "src/tracing/traced-value.h"
+
+#if V8_ENABLE_WEBASSEMBLY
 #include "src/wasm/function-compiler.h"
+#endif  // V8_ENABLE_WEBASSEMBLY
 
 namespace v8 {
 namespace internal {
@@ -61,8 +64,6 @@ bool OptimizedCompilationInfo::FlagSetIsValid(Flag flag) const {
   switch (flag) {
     case kPoisonRegisterArguments:
       return untrusted_code_mitigations();
-    case kFunctionContextSpecializing:
-      return !IsNativeContextIndependent();
     default:
       return true;
   }
@@ -83,6 +84,7 @@ bool OptimizedCompilationInfo::FlagGetIsValid(Flag flag) const {
 
 void OptimizedCompilationInfo::ConfigureFlags() {
   if (FLAG_untrusted_code_mitigations) set_untrusted_code_mitigations();
+  if (FLAG_turbo_inline_js_wasm_calls) set_inline_js_wasm_calls();
 
   switch (code_kind_) {
     case CodeKind::TURBOFAN:
@@ -91,7 +93,6 @@ void OptimizedCompilationInfo::ConfigureFlags() {
       }
       V8_FALLTHROUGH;
     case CodeKind::TURBOPROP:
-    case CodeKind::NATIVE_CONTEXT_INDEPENDENT:
       set_called_with_code_start_register();
       set_switch_jump_table();
       if (FLAG_turbo_splitting) set_splitting();
@@ -170,6 +171,7 @@ StackFrame::Type OptimizedCompilationInfo::GetOutputStackFrameType() const {
     case CodeKind::BYTECODE_HANDLER:
     case CodeKind::BUILTIN:
       return StackFrame::STUB;
+#if V8_ENABLE_WEBASSEMBLY
     case CodeKind::WASM_FUNCTION:
       return StackFrame::WASM;
     case CodeKind::WASM_TO_CAPI_FUNCTION:
@@ -180,6 +182,7 @@ StackFrame::Type OptimizedCompilationInfo::GetOutputStackFrameType() const {
       return StackFrame::WASM_TO_JS;
     case CodeKind::C_WASM_ENTRY:
       return StackFrame::C_WASM_ENTRY;
+#endif  // V8_ENABLE_WEBASSEMBLY
     default:
       UNIMPLEMENTED();
       return StackFrame::NONE;
@@ -191,6 +194,7 @@ void OptimizedCompilationInfo::SetCode(Handle<Code> code) {
   code_ = code;
 }
 
+#if V8_ENABLE_WEBASSEMBLY
 void OptimizedCompilationInfo::SetWasmCompilationResult(
     std::unique_ptr<wasm::WasmCompilationResult> wasm_compilation_result) {
   wasm_compilation_result_ = std::move(wasm_compilation_result);
@@ -200,6 +204,7 @@ std::unique_ptr<wasm::WasmCompilationResult>
 OptimizedCompilationInfo::ReleaseWasmCompilationResult() {
   return std::move(wasm_compilation_result_);
 }
+#endif  // V8_ENABLE_WEBASSEMBLY
 
 bool OptimizedCompilationInfo::has_context() const {
   return !closure().is_null();
